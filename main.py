@@ -9,10 +9,26 @@ import gspread
 from google.oauth2.service_account import Credentials
 from dateutil import parser as dtparser
 
+
+# ----------------------------
+# Small utilities (used by config too)
+# ----------------------------
+def normalize_spreadsheet_id(value: str) -> str:
+    """
+    Accepts either a bare spreadsheet ID or a full Google Sheets URL.
+    Returns the bare spreadsheet ID, stripped of whitespace/quotes.
+    """
+    v = (value or "").strip().strip('"').strip("'")
+    marker = "/spreadsheets/d/"
+    if marker in v:
+        v = v.split(marker, 1)[1].split("/", 1)[0]
+    return v
+
+
 # ----------------------------
 # Config (env)
 # ----------------------------
-SPREADSHEET_ID = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]   # Active-Investing spreadsheet id
+SPREADSHEET_ID = normalize_spreadsheet_id(os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"])  # Active-Investing spreadsheet id
 WORKSHEET_NAME = os.getenv("HISTORY_SHEET_NAME", "History")
 
 # Alpaca Trading API (paper default)
@@ -31,11 +47,14 @@ DATA_START_ROW = 2
 MANAGED_PREFIXES = ("alpaca.", "meta.")
 
 # How many columns we will search for/manage (A.. ?). Anything beyond is never touched.
-# You can put your personal columns safely to the RIGHT of this range.
+# Put your personal columns safely to the RIGHT of this range.
 RESERVED_MANAGED_COLS = int(os.getenv("HISTORY_RESERVED_MANAGED_COLS", "120"))
 
 # Optional loop mode
 RUN_EVERY_SECONDS = int(os.getenv("RUN_EVERY_SECONDS", "0"))  # 0 = run once and exit
+
+# Optional debug prints (no secrets)
+DEBUG = os.getenv("DEBUG", "0").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 # ----------------------------
@@ -49,25 +68,28 @@ def col_to_a1(col: int) -> str:
         s = chr(65 + r) + s
     return s
 
+
 def now_iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def safe_cell_value(v: Any) -> str:
     if v is None:
         return ""
     if isinstance(v, (int, float, bool, str)):
         return str(v)
-    # lists/dicts -> json
     try:
         return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
     except Exception:
         return str(v)
+
 
 def truncate_cell(s: str, limit: int = 45000) -> str:
     # Google Sheets cells have a max size; keep some buffer.
     if s is None:
         return ""
     return s if len(s) <= limit else s[:limit] + "…"
+
 
 def flatten(obj: Any, parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -77,20 +99,35 @@ def flatten(obj: Any, parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
             if isinstance(v, dict):
                 out.update(flatten(v, key, sep=sep))
             elif isinstance(v, list):
-                # keep lists as compact JSON
-                out[key] = v
+                out[key] = v  # keep lists as compact JSON later
             else:
                 out[key] = v
     else:
         out[parent_key or "value"] = obj
     return out
 
+
 def effective_time(activity: Dict[str, Any]) -> str:
-    # Based on docs/examples: trade uses transaction_time; NTA often uses date. :contentReference[oaicite:2]{index=2}
+    # Alpaca activity objects vary by type; try common time-ish keys.
     for k in ("transaction_time", "date", "settle_date", "timestamp", "created_at"):
         if k in activity and activity[k]:
             return str(activity[k])
     return ""
+
+
+def parse_dt_utc(s: str) -> datetime:
+    """
+    Always return a tz-aware datetime in UTC.
+    If the timestamp has no tz info, assume UTC.
+    """
+    try:
+        dt = dtparser.parse(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
 
 def alpaca_headers() -> Dict[str, str]:
     return {
@@ -98,9 +135,11 @@ def alpaca_headers() -> Dict[str, str]:
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
 
+
 def fetch_account_activities() -> List[Dict[str, Any]]:
     """
-    Fetch recent activities in descending order with pagination via page_token/page_size. :contentReference[oaicite:3]{index=3}
+    Fetch recent activities in descending order with pagination.
+    Uses a cursor-like approach with page_token as the last item id.
     """
     url = f"{ALPACA_BASE_URL.rstrip('/')}/v2/account/activities"
     activities: List[Dict[str, Any]] = []
@@ -116,13 +155,20 @@ def fetch_account_activities() -> List[Dict[str, Any]]:
 
         r = requests.get(url, headers=alpaca_headers(), params=params, timeout=30)
         r.raise_for_status()
-        batch = r.json()  # list
+
+        batch = r.json()
         if not isinstance(batch, list) or not batch:
             break
 
         activities.extend(batch)
+
+        # Cursor forward
         page_token = batch[-1].get("id")
         if not page_token:
+            break
+
+        # If we got fewer than page size, likely done
+        if len(batch) < PAGE_SIZE:
             break
 
     return activities
@@ -136,7 +182,14 @@ def get_gspread_client() -> gspread.Client:
     info = json.loads(sa_json)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
+
+    if DEBUG:
+        print("Google service account:", info.get("client_email"))
+        print("Spreadsheet ID:", SPREADSHEET_ID)
+        print("Worksheet:", WORKSHEET_NAME)
+
     return gspread.authorize(creds)
+
 
 def open_worksheet(gc: gspread.Client) -> gspread.Worksheet:
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -145,16 +198,18 @@ def open_worksheet(gc: gspread.Client) -> gspread.Worksheet:
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=RESERVED_MANAGED_COLS + 20)
 
+
 def read_header_row(ws: gspread.Worksheet) -> List[str]:
     end_col = col_to_a1(RESERVED_MANAGED_COLS)
     values = ws.get(f"A{HEADER_ROW}:{end_col}{HEADER_ROW}")
     if not values:
         return [""] * RESERVED_MANAGED_COLS
+
     row = values[0]
-    # pad to full reserved width
     if len(row) < RESERVED_MANAGED_COLS:
         row += [""] * (RESERVED_MANAGED_COLS - len(row))
     return row[:RESERVED_MANAGED_COLS]
+
 
 def build_managed_header_map(headers: List[str]) -> Dict[str, int]:
     # header -> 1-based column index
@@ -164,12 +219,13 @@ def build_managed_header_map(headers: List[str]) -> Dict[str, int]:
             out[h] = i
     return out
 
+
 def first_empty_header_col(headers: List[str]) -> Optional[int]:
-    # empty = "" in reserved range
     for i, h in enumerate(headers, start=1):
         if not h:
             return i
     return None
+
 
 def ensure_base_headers(ws: gspread.Worksheet) -> Tuple[List[str], Dict[str, int]]:
     headers = read_header_row(ws)
@@ -180,7 +236,6 @@ def ensure_base_headers(ws: gspread.Worksheet) -> Tuple[List[str], Dict[str, int
         "meta.effective_time",
         "meta.pulled_at_utc",
         "meta.raw_json",
-        "alpaca.activity_type",
     ]
 
     updates = []
@@ -197,55 +252,60 @@ def ensure_base_headers(ws: gspread.Worksheet) -> Tuple[List[str], Dict[str, int
         updates.append((empty_col, name))
         hmap[name] = empty_col
 
-    # write any new base headers
     if updates:
+        # write headers one-by-one (simple + reliable)
         for col, name in updates:
             ws.update_cell(HEADER_ROW, col, name)
 
     return headers, hmap
 
+
 def claim_header(ws: gspread.Worksheet, headers: List[str], hmap: Dict[str, int], name: str) -> int:
     if name in hmap:
         return hmap[name]
+
     empty_col = first_empty_header_col(headers)
     if empty_col is None:
-        # fall back: don't create more columns; caller should rely on meta.raw_json
+        # out of reserved space: caller should rely on meta.raw_json for completeness
         return -1
+
     headers[empty_col - 1] = name
     ws.update_cell(HEADER_ROW, empty_col, name)
     hmap[name] = empty_col
     return empty_col
 
+
 def get_existing_id_rows(ws: gspread.Worksheet, id_col: int) -> Dict[str, int]:
-    # col_values returns up to last non-empty; row 1 is header
     col_vals = ws.col_values(id_col)
     out: Dict[str, int] = {}
-    for idx, v in enumerate(col_vals[1:], start=2):
+    for idx, v in enumerate(col_vals[1:], start=2):  # skip header
         if v:
             out[v] = idx
     return out
 
+
 def insert_empty_rows(ws: gspread.Worksheet, how_many: int, at_row: int) -> None:
     if how_many <= 0:
         return
-    # Use Sheets API insertDimension to insert completely empty rows.
-    sheet_id = ws.id
-    # 0-based indices; startIndex=at_row-1
-    start = at_row - 1
+    sheet_id = ws.id  # Google "sheetId" for this worksheet/tab
+    start = at_row - 1  # 0-based
     body = {
-        "requests": [{
-            "insertDimension": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "dimension": "ROWS",
-                    "startIndex": start,
-                    "endIndex": start + how_many
-                },
-                "inheritFromBefore": False
+        "requests": [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": start,
+                        "endIndex": start + how_many,
+                    },
+                    "inheritFromBefore": False,
+                }
             }
-        }]
+        ]
     }
     ws.spreadsheet.batch_update(body)
+
 
 def batch_update_cells(ws: gspread.Worksheet, updates: List[Tuple[int, int, str]]) -> None:
     """
@@ -255,7 +315,6 @@ def batch_update_cells(ws: gspread.Worksheet, updates: List[Tuple[int, int, str]
     if not updates:
         return
 
-    # group by row for fewer API calls, but still only touch target columns
     updates_by_row: Dict[int, List[Tuple[int, str]]] = {}
     for r, c, v in updates:
         updates_by_row.setdefault(r, []).append((c, v))
@@ -268,6 +327,7 @@ def batch_update_cells(ws: gspread.Worksheet, updates: List[Tuple[int, int, str]
             data.append({"range": a1, "values": [[v]]})
 
     ws.batch_update(data, value_input_option="RAW")
+
 
 def sync_once() -> None:
     gc = get_gspread_client()
@@ -299,20 +359,18 @@ def sync_once() -> None:
         if consecutive_known >= STOP_AFTER_CONSECUTIVE_KNOWN:
             break
 
-    # Insert new rows (newest should end up closest to top, i.e., row 2)
-    # We insert N empty rows at row 2, then write values:
-    # - row 2 gets newest, row 3 gets next newest, etc.
+    # Sort new activities newest-first using tz-aware UTC
     new_acts_sorted = sorted(
         new_acts,
-        key=lambda a: dtparser.parse(effective_time(a)) if effective_time(a) else datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True
+        key=lambda a: parse_dt_utc(effective_time(a)) if effective_time(a) else datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
     )
 
+    # Insert N empty rows at row 2 so newest land near the top
     n_new = len(new_acts_sorted)
     if n_new:
         insert_empty_rows(ws, n_new, DATA_START_ROW)
-
-        # Existing rows moved down by n_new
+        # Existing rows moved down by n_new (only those at/after DATA_START_ROW)
         existing = {k: (r + n_new if r >= DATA_START_ROW else r) for k, r in existing.items()}
 
     cell_updates: List[Tuple[int, int, str]] = []
@@ -325,7 +383,6 @@ def sync_once() -> None:
         act_effective = effective_time(act)
         raw = truncate_cell(json.dumps(act, ensure_ascii=False))
 
-        # base/meta fields
         record: Dict[str, Any] = {
             "meta.id": act_id,
             "meta.effective_time": act_effective,
@@ -338,13 +395,12 @@ def sync_once() -> None:
         for k, v in flat.items():
             record[f"alpaca.{k}"] = v
 
-        # ensure headers exist for keys we want in columns
-        for key in list(record.keys()):
+        # Ensure headers exist + stage cell updates (ONLY managed columns)
+        for key, val in record.items():
             col = claim_header(ws, headers, hmap, key)
             if col == -1:
-                # no space left; rely on meta.raw_json for completeness
-                continue
-            cell_updates.append((row, col, safe_cell_value(record[key])))
+                continue  # out of reserved space; raw_json still holds everything
+            cell_updates.append((row, col, safe_cell_value(val)))
 
     # Write new ones
     for i, act in enumerate(new_acts_sorted):
@@ -352,7 +408,7 @@ def sync_once() -> None:
         stage_activity_write(row, act)
         existing[str(act.get("id", ""))] = row
 
-    # Update already-existing rows we re-fetched (keeps data “complete” if Alpaca adds fields)
+    # Refresh existing rows we re-fetched (keeps data complete if Alpaca adds fields)
     for act in recent_for_update:
         act_id = str(act.get("id", ""))
         row = existing.get(act_id)
@@ -363,12 +419,14 @@ def sync_once() -> None:
 
     print(f"History sync complete. Inserted {n_new} new activities. Updated {len(recent_for_update)} existing rows.")
 
+
 def main() -> None:
     while True:
         sync_once()
         if RUN_EVERY_SECONDS <= 0:
             break
         time.sleep(RUN_EVERY_SECONDS)
+
 
 if __name__ == "__main__":
     main()
