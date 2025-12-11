@@ -1,0 +1,4 @@
+gspread==6.1.4
+google-auth==2.34.0
+requests==2.32.3
+python-dateutil==2.9.0.post0
