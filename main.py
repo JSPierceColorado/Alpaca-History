@@ -9,7 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest
-from alpaca.trading.enums import QueryOrderStatus, Sort
+from alpaca.trading.enums import QueryOrderStatus
+
+# Sort is in alpaca.common.enums in alpaca-py (0.4x+). Fallback included for safety.
+try:
+    from alpaca.common.enums import Sort
+except ImportError:  # pragma: no cover
+    from alpaca.trading.enums import Sort  # type: ignore
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -70,7 +76,7 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
 
     Dedup by id as a safety net.
     """
-    limit = 500  # alpaca max
+    limit = 500  # GetOrdersRequest max is 500
     until: Optional[dt.datetime] = None
     seen: Dict[str, Dict[str, Any]] = {}
 
@@ -106,7 +112,6 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
                     return v
                 if isinstance(v, str) and v:
                     try:
-                        # Parse ISO-8601 strings if any slipped through
                         return dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
                     except Exception:
                         pass
@@ -115,7 +120,6 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
         ts_list = [pick_ts(od) for od in batch_dicts]
         ts_list = [t for t in ts_list if t is not None]
         if not ts_list:
-            # If no timestamps, we can't page safely; stop.
             print("[alpaca] No timestamps found; stopping pagination.")
             break
 
@@ -135,7 +139,6 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
     orders = list(seen.values())
 
     def sort_key(od: Dict[str, Any]) -> Tuple:
-        # submitted_at if possible else created_at
         for k in ("submitted_at", "created_at"):
             v = od.get(k)
             if isinstance(v, dt.datetime):
@@ -228,7 +231,7 @@ def chunked_write_values(
     chunk_rows: int = 5000,
 ) -> None:
     """
-    Writes values starting at A1 using batchUpdate in chunks to avoid request size limits.
+    Writes values starting at A1 using values.batchUpdate in chunks.
     """
     data = []
     for start in range(0, len(values), chunk_rows):
@@ -288,7 +291,6 @@ def normalize_cell(v: Any) -> Any:
     if isinstance(v, dt.datetime):
         return v.isoformat()
     if isinstance(v, (dict, list)):
-        # Avoid huge JSON by default; can still see structure
         return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
     return str(v)
 
@@ -326,15 +328,12 @@ def main() -> int:
 
     print(f"[run] paper={paper} sheet={spreadsheet_id} tab={tab_name}")
 
-    # Alpaca
     trading = TradingClient(alpaca_key, alpaca_secret, paper=paper)
     orders = fetch_all_orders(trading)
     print(f"[alpaca] total_unique_orders={len(orders)}")
 
-    # Build table
     table = build_sheet_table(orders)
 
-    # Sheets
     svc = sheets_service()
     ensure_tab_exists(svc, spreadsheet_id, tab_name)
     clear_tab_values(svc, spreadsheet_id, tab_name)
