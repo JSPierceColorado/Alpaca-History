@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import re
 import sys
 import time
 import datetime as dt
@@ -22,6 +23,22 @@ from googleapiclient.errors import HttpError
 
 
 TAB_NAME_DEFAULT = "Orders"
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def colnum_to_letter(n: int) -> str:
+    """
+    1 -> A, 26 -> Z, 27 -> AA, ...
+    """
+    if n <= 0:
+        raise ValueError("Column count must be >= 1")
+    letters = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
 
 
 # -------------------------
@@ -125,23 +142,39 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
 # -------------------------
 def load_service_account_info() -> Dict[str, Any]:
     """
-    Accept either:
-      - GOOGLE_SERVICE_ACCOUNT_JSON  (raw JSON)
+    Preferred:
+      - GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON)
+
+    Optional fallback:
       - GOOGLE_SERVICE_ACCOUNT_JSON_B64 (base64 JSON)
+        (handles whitespace/newlines + missing padding)
     """
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
-
-    if b64:
-        decoded = base64.b64decode(b64).decode("utf-8")
-        return json.loads(decoded)
-
     if raw:
         return json.loads(raw)
 
-    raise RuntimeError(
-        "Missing Google credentials. Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64."
-    )
+    b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+    if not b64:
+        raise RuntimeError(
+            "Missing Google credentials. Set GOOGLE_SERVICE_ACCOUNT_JSON (preferred) "
+            "or GOOGLE_SERVICE_ACCOUNT_JSON_B64."
+        )
+
+    if b64.lstrip().startswith("{"):
+        return json.loads(b64)
+
+    cleaned = re.sub(r"\s+", "", b64)
+    rem = len(cleaned) % 4
+    if rem in (2, 3):
+        cleaned += "=" * (4 - rem)
+    elif rem == 1:
+        raise RuntimeError(
+            f"GOOGLE_SERVICE_ACCOUNT_JSON_B64 looks corrupted (length {len(cleaned)} mod 4 == 1). "
+            "Re-generate it or use GOOGLE_SERVICE_ACCOUNT_JSON instead."
+        )
+
+    decoded = base64.b64decode(cleaned)
+    return json.loads(decoded.decode("utf-8"))
 
 
 def sheets_service():
@@ -176,11 +209,16 @@ def ensure_tab_exists(svc, spreadsheet_id: str, tab_name: str) -> None:
     svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
 
 
-def clear_tab_values(svc, spreadsheet_id: str, tab_name: str) -> None:
-    print(f"[sheets] Clearing values in tab: {tab_name}")
+def clear_export_range_only(svc, spreadsheet_id: str, tab_name: str, last_col_letter: str) -> None:
+    """
+    Clear ONLY the export columns so we don't touch AA+ (or anything beyond last_col_letter).
+    Example: last_col_letter='Z' => clears A:Z.
+    """
+    rng = f"{tab_name}!A:{last_col_letter}"
+    print(f"[sheets] Clearing export range only: {rng}")
     svc.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id,
-        range=tab_name,
+        range=rng,
         body={}
     ).execute()
 
@@ -190,17 +228,25 @@ def chunked_write_values(
     spreadsheet_id: str,
     tab_name: str,
     values: List[List[Any]],
+    last_col_letter: str,
     chunk_rows: int = 5000,
 ) -> None:
+    """
+    Writes values starting at A1 in chunks.
+    We specify explicit ranges (A..last_col_letter) to avoid any accidental spillover.
+    """
     data = []
+    width = len(values[0]) if values else 1
+
     for start in range(0, len(values), chunk_rows):
         chunk = values[start:start + chunk_rows]
         start_row = 1 + start  # 1-indexed
-        rng = f"{tab_name}!A{start_row}"
+        end_row = start_row + len(chunk) - 1
+        rng = f"{tab_name}!A{start_row}:{last_col_letter}{end_row}"
         data.append({"range": rng, "values": chunk})
 
     body = {"valueInputOption": "RAW", "data": data}
-    print(f"[sheets] Writing {len(values)} rows in {len(data)} chunk(s)")
+    print(f"[sheets] Writing {len(values)} rows in {len(data)} chunk(s) (A..{last_col_letter})")
     svc.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body=body
@@ -254,14 +300,17 @@ def normalize_cell(v: Any) -> Any:
     return str(v)
 
 
-def build_sheet_table(orders: List[Dict[str, Any]]) -> List[List[Any]]:
+def get_columns() -> List[str]:
     cols = os.getenv("ORDERS_COLUMNS", "")
-    columns = [c.strip() for c in cols.split(",") if c.strip()] if cols else DEFAULT_COLUMNS
+    if cols.strip():
+        return [c.strip() for c in cols.split(",") if c.strip()]
+    return DEFAULT_COLUMNS
 
+
+def build_sheet_table(orders: List[Dict[str, Any]], columns: List[str]) -> List[List[Any]]:
     rows: List[List[Any]] = [columns]
     for od in orders:
         rows.append([normalize_cell(od.get(c)) for c in columns])
-
     return rows
 
 
@@ -282,20 +331,35 @@ def main() -> int:
 
     tab_name = os.getenv("GOOGLE_SHEET_TAB_ORDERS", TAB_NAME_DEFAULT).strip() or TAB_NAME_DEFAULT
 
-    print(f"[run] exporting now | paper={paper} | sheet={spreadsheet_id} | tab={tab_name}")
+    columns = get_columns()
+    last_col_letter = colnum_to_letter(len(columns))  # default columns -> 26 -> Z
+
+    print(
+        f"[run] exporting now | paper={paper} | sheet={spreadsheet_id} | tab={tab_name} "
+        f"| cols={len(columns)} (A..{last_col_letter})"
+    )
 
     trading = TradingClient(alpaca_key, alpaca_secret, paper=paper)
     orders = fetch_all_orders(trading)
     print(f"[alpaca] total_unique_orders={len(orders)}")
 
-    table = build_sheet_table(orders)
+    table = build_sheet_table(orders, columns)
 
     svc = sheets_service()
     ensure_tab_exists(svc, spreadsheet_id, tab_name)
-    clear_tab_values(svc, spreadsheet_id, tab_name)
+
+    # IMPORTANT: Only clear the export columns (e.g., A:Z) so AA+ remains untouched.
+    clear_export_range_only(svc, spreadsheet_id, tab_name, last_col_letter)
 
     chunk_rows = int(os.getenv("SHEETS_WRITE_CHUNK_ROWS", "5000"))
-    chunked_write_values(svc, spreadsheet_id, tab_name, table, chunk_rows=chunk_rows)
+    chunked_write_values(
+        svc,
+        spreadsheet_id,
+        tab_name,
+        table,
+        last_col_letter=last_col_letter,
+        chunk_rows=chunk_rows,
+    )
 
     print("[done] export complete")
     return 0
