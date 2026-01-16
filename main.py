@@ -4,7 +4,6 @@ import base64
 import sys
 import time
 import datetime as dt
-from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 from alpaca.trading.client import TradingClient
@@ -22,36 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-LOCAL_TZ_DEFAULT = "America/Denver"
 TAB_NAME_DEFAULT = "Orders"
-
-
-# -------------------------
-# Time gating (8am Denver)
-# -------------------------
-def should_run_now() -> bool:
-    """
-    Designed for Railway Cron that triggers in UTC.
-    We run ONLY when it's ~8:00am in America/Denver (weekdays),
-    unless FORCE_RUN=1.
-    """
-    if os.getenv("FORCE_RUN", "").strip() == "1":
-        return True
-
-    tz = ZoneInfo(os.getenv("LOCAL_TZ", LOCAL_TZ_DEFAULT))
-    now = dt.datetime.now(tz)
-
-    if now.weekday() >= 5:  # 5=Sat, 6=Sun
-        print(f"[skip] Weekend in {tz}: {now.isoformat()}")
-        return False
-
-    # Railway cron can drift a few minutes; allow a window.
-    window_minutes = int(os.getenv("RUN_WINDOW_MINUTES", "20"))
-    if now.hour == 8 and 0 <= now.minute <= window_minutes:
-        return True
-
-    print(f"[skip] Not in run window in {tz}: {now.isoformat()}")
-    return False
 
 
 # -------------------------
@@ -76,7 +46,7 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
 
     Dedup by id as a safety net.
     """
-    limit = 500  # GetOrdersRequest max is 500
+    limit = 500
     until: Optional[dt.datetime] = None
     seen: Dict[str, Dict[str, Any]] = {}
 
@@ -103,9 +73,8 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
             if oid:
                 seen[oid] = od
 
-        # Find the oldest submission timestamp in this batch
+        # Find the oldest timestamp in this batch to page further back
         def pick_ts(od: Dict[str, Any]) -> Optional[dt.datetime]:
-            # alpaca usually provides submitted_at; fall back to created_at
             for k in ("submitted_at", "created_at", "updated_at"):
                 v = od.get(k)
                 if isinstance(v, dt.datetime):
@@ -119,23 +88,20 @@ def fetch_all_orders(trading: TradingClient, max_pages: int = 20000) -> List[Dic
 
         ts_list = [pick_ts(od) for od in batch_dicts]
         ts_list = [t for t in ts_list if t is not None]
+
         if not ts_list:
             print("[alpaca] No timestamps found; stopping pagination.")
             break
 
         oldest = min(ts_list)
-
-        # Move "until" just before the oldest timestamp to avoid repeats
         until = oldest - dt.timedelta(microseconds=1)
 
-        # If we got less than limit, we're done
         if len(batch_dicts) < limit:
             break
 
-        # Small throttle (optional)
         time.sleep(float(os.getenv("ALPACA_THROTTLE_SECONDS", "0.1")))
 
-    # Return orders sorted oldest->newest for nicer sheet reading
+    # Sort oldest->newest for nicer sheet reading
     orders = list(seen.values())
 
     def sort_key(od: Dict[str, Any]) -> Tuple:
@@ -206,11 +172,7 @@ def ensure_tab_exists(svc, spreadsheet_id: str, tab_name: str) -> None:
         return
 
     print(f"[sheets] Creating tab: {tab_name}")
-    body = {
-        "requests": [
-            {"addSheet": {"properties": {"title": tab_name}}}
-        ]
-    }
+    body = {"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}
     svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
 
 
@@ -230,9 +192,6 @@ def chunked_write_values(
     values: List[List[Any]],
     chunk_rows: int = 5000,
 ) -> None:
-    """
-    Writes values starting at A1 using values.batchUpdate in chunks.
-    """
     data = []
     for start in range(0, len(values), chunk_rows):
         chunk = values[start:start + chunk_rows]
@@ -310,9 +269,6 @@ def build_sheet_table(orders: List[Dict[str, Any]]) -> List[List[Any]]:
 # Entrypoint
 # -------------------------
 def main() -> int:
-    if not should_run_now():
-        return 0
-
     alpaca_key = os.getenv("ALPACA_API_KEY", "").strip()
     alpaca_secret = os.getenv("ALPACA_API_SECRET", "").strip()
     paper = os.getenv("ALPACA_PAPER", "1").strip() == "1"
@@ -326,7 +282,7 @@ def main() -> int:
 
     tab_name = os.getenv("GOOGLE_SHEET_TAB_ORDERS", TAB_NAME_DEFAULT).strip() or TAB_NAME_DEFAULT
 
-    print(f"[run] paper={paper} sheet={spreadsheet_id} tab={tab_name}")
+    print(f"[run] exporting now | paper={paper} | sheet={spreadsheet_id} | tab={tab_name}")
 
     trading = TradingClient(alpaca_key, alpaca_secret, paper=paper)
     orders = fetch_all_orders(trading)
